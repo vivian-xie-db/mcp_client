@@ -1,0 +1,10 @@
+fastmcp
+httpx
+backoff
+python-dotenv
+requests
+pandas
+databricks-sdk
+uvicorn
+dash
+dash-bootstrap-components
