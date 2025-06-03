@@ -6,13 +6,14 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 import nest_asyncio
 from databricks.sdk.core import Config
+import time
 
 app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.BOOTSTRAP],
     suppress_callback_exceptions=True
 )
-config = Config()
+config = Config(profile = "e2-demo-field-eng")
 token = config.oauth_token().access_token
 headers = {"Authorization": f"Bearer {token}"}
 app.index_string = '''
@@ -120,10 +121,21 @@ app.index_string = '''
 # Helper to run async code in sync Dash callbacks
 nest_asyncio.apply()
 def run_async(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If already running (e.g., in Jupyter), use nest_asyncio
+            import nest_asyncio
+            nest_asyncio.apply()
+            return asyncio.ensure_future(coro)
+        else:
+            return loop.run_until_complete(coro)
+    except RuntimeError:
+        # No event loop, create one
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
 
-# Remove global client
-# client = None
 
 def create_client(url, token):
     transport = StreamableHttpTransport(
@@ -132,40 +144,55 @@ def create_client(url, token):
     )
     return Client(transport)
 
-def list_tools(url, token):
-    try:
-        client = create_client(url, token)
-        async def _list():
-            async with client:
-                return await client.list_tools()
-        tools = run_async(_list())
-        def serialize(obj):
-            if hasattr(obj, "dict"):
-                return obj.dict()
-            elif hasattr(obj, "__dict__"):
-                return obj.__dict__
-            else:
-                return str(obj)
-        return [serialize(t) for t in tools]
-    except Exception as e:
-        return []
+def list_tools(url, token, max_retries=2):
+    for attempt in range(max_retries):
+        try:
+            client = create_client(url, token)
+            async def _list():
+                async with client:
+                    return await client.list_tools()
+            tools = run_async(_list())
+            def serialize(obj):
+                if hasattr(obj, "dict"):
+                    return obj.dict()
+                elif hasattr(obj, "__dict__"):
+                    return obj.__dict__
+                else:
+                    return str(obj)
+            return [serialize(t) for t in tools]
+        except Exception as e:
+            # Detect token/connection errors
+            if "401" in str(e) or "Unauthorized" in str(e) or "expired" in str(e):
+                return "__AUTH_ERROR__"
+            # For connection errors, retry
+            if "Connection" in str(e) or "timeout" in str(e):
+                time.sleep(0.5)  # brief pause before retry
+                continue
+            return []
+    return "__CONN_ERROR__"
 
-def call_tool(name, arguments, url, token):
-    try:
-        client = create_client(url, token)
-        async def _call():
-            async with client:
-                return await client.call_tool(name=name, arguments=arguments)
-        result = run_async(_call())
-        # Only return the final text field (assume result is a list of TextContent)
-        if isinstance(result, list) and result and hasattr(result[0], 'text'):
-            return result[0].text
-        elif isinstance(result, list) and result and isinstance(result[0], dict) and 'text' in result[0]:
-            return result[0]['text']
-        else:
-            return str(result)
-    except Exception as e:
-        return f"Error: {e}"
+def call_tool(name, arguments, url, token, max_retries=2):
+    for attempt in range(max_retries):
+        try:
+            client = create_client(url, token)
+            async def _call():
+                async with client:
+                    return await client.call_tool(name=name, arguments=arguments)
+            result = run_async(_call())
+            if isinstance(result, list) and result and hasattr(result[0], 'text'):
+                return result[0].text
+            elif isinstance(result, list) and result and isinstance(result[0], dict) and 'text' in result[0]:
+                return result[0]['text']
+            else:
+                return str(result)
+        except Exception as e:
+            if "401" in str(e) or "Unauthorized" in str(e) or "expired" in str(e):
+                return "__AUTH_ERROR__"
+            if "Connection" in str(e) or "timeout" in str(e):
+                time.sleep(0.5)
+                continue
+            return f"Error: {e}"
+    return "__CONN_ERROR__"
 
 # Dash app
 app.layout = dbc.Container([
@@ -284,7 +311,10 @@ app.layout = dbc.Container([
     ),
     dcc.Store(id="tools-store"),
     dcc.Store(id="selected-tool-store"),
-    dcc.Store(id="connection-store")
+    dcc.Store(id="connection-store"),
+    # Add keep-alive status and interval
+    html.Div(id="keepalive-status"),
+    dcc.Interval(id="keepalive-interval", interval=5*60*1000, n_intervals=0)  # 5 minutes
 ], fluid=True, style={"backgroundColor": "#fff", "minHeight": "100vh"})
 
 # Update connect callback to store connection info
@@ -317,7 +347,11 @@ def list_tools_callback(n, conn):
     if not conn:
         return [], dbc.Alert("Not connected.", color="warning")
     tools = list_tools(conn["url"], conn["token"])
-    if not tools:
+    if tools == "__AUTH_ERROR__":
+        return [], dbc.Alert("Authentication error, please reconnect.", color="danger")
+    elif tools == "__CONN_ERROR__":
+        return [], dbc.Alert("Connection error, please try again later.", color="danger")
+    elif not tools:
         return [], dbc.Alert("No tools found or not connected.", color="warning")
     # List as buttons
     btns = [
@@ -384,12 +418,34 @@ def call_tool_callback(n, tool, values, ids, conn):
     # Build arguments dict
     args = {id['key']: val for id, val in zip(ids, values)}
     result = call_tool(tool['name'], args, conn["url"], conn["token"])
-    return dbc.Card([
-        dbc.CardBody([
-            html.H6("Result", className="mb-2"),
-            html.Pre(result, style={"backgroundColor": "#f8f9fa", "padding": "1em"}),
-        ])
-    ], className="shadow-sm")
+    if result == "__AUTH_ERROR__":
+        return dbc.Alert("Authentication error, please reconnect.", color="danger")
+    elif result == "__CONN_ERROR__":
+        return dbc.Alert("Connection error, please try again later.", color="danger")
+    else:
+        return dbc.Card([
+            dbc.CardBody([
+                html.H6("Result", className="mb-2"),
+                html.Pre(result, style={"backgroundColor": "#f8f9fa", "padding": "1em"}),
+            ])
+        ], className="shadow-sm")
+
+# Periodic keep-alive callback
+@app.callback(
+    Output("keepalive-status", "children"),
+    Input("keepalive-interval", "n_intervals"),
+    State("connection-store", "data"),
+    prevent_initial_call=True
+)
+def keepalive_callback(n_intervals, conn):
+    if not conn:
+        return ""
+    tools = list_tools(conn["url"], conn["token"])
+    if tools == "__AUTH_ERROR__":
+        return dbc.Alert("Session expired or not authorized. Please reconnect.", color="danger")
+    elif tools == "__CONN_ERROR__":
+        return dbc.Alert("Connection error. Please check your network or reconnect.", color="danger")
+    return ""
 
 if __name__ == "__main__":
     app.run_server(debug=True) 
