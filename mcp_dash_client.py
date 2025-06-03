@@ -6,6 +6,7 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 import nest_asyncio
 from databricks.sdk.core import Config
+
 app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.BOOTSTRAP],
@@ -13,7 +14,7 @@ app = dash.Dash(
 )
 config = Config()
 token = config.oauth_token().access_token
-
+headers = {"Authorization": f"Bearer {token}"}
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -121,22 +122,19 @@ nest_asyncio.apply()
 def run_async(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
-# Global client (for demo; in production, use session/user context)
-client = None
+# Remove global client
+# client = None
 
 def create_client(url, token):
-    global client
     transport = StreamableHttpTransport(
         url=url,
         headers={"Authorization": f"Bearer {token}"}
     )
-    client = Client(transport)
-    return True
+    return Client(transport)
 
-def list_tools():
-    if not client:
-        return []
+def list_tools(url, token):
     try:
+        client = create_client(url, token)
         async def _list():
             async with client:
                 return await client.list_tools()
@@ -152,10 +150,9 @@ def list_tools():
     except Exception as e:
         return []
 
-def call_tool(name, arguments):
-    if not client:
-        return "Not connected."
+def call_tool(name, arguments, url, token):
     try:
+        client = create_client(url, token)
         async def _call():
             async with client:
                 return await client.call_tool(name=name, arguments=arguments)
@@ -204,7 +201,7 @@ app.layout = dbc.Container([
                 ], md=6),
                 dbc.Col([
                     dbc.Label("Token"),
-                    dbc.Input(id="token", value=token, type="password"),
+                    dbc.Input(id="token", value=headers['Authorization'].split(' ')[1], type="password"),
                 ], md=4),
                 dbc.Col([
                     dbc.Button("Connect", id="connect-btn", color="success", className="mt-4 w-100"),
@@ -284,15 +281,16 @@ app.layout = dbc.Container([
         </style>
         """,
         dangerously_allow_html=True
-    )
+    ),
+    dcc.Store(id="tools-store"),
+    dcc.Store(id="selected-tool-store"),
+    dcc.Store(id="connection-store")
 ], fluid=True, style={"backgroundColor": "#fff", "minHeight": "100vh"})
 
-# Store tools and selected tool in dcc.Store
-app.layout.children.append(dcc.Store(id="tools-store"))
-app.layout.children.append(dcc.Store(id="selected-tool-store"))
-
+# Update connect callback to store connection info
 @app.callback(
     Output("connect-status", "children"),
+    Output("connection-store", "data"),
     Input("connect-btn", "n_clicks"),
     State("url", "value"),
     State("token", "value"),
@@ -300,21 +298,25 @@ app.layout.children.append(dcc.Store(id="selected-tool-store"))
 )
 def connect(n, url, token):
     if not url or not token:
-        return "Please provide both URL and token."
+        return "Please provide both URL and token.", dash.no_update
     try:
-        create_client(url, token)
-        return dbc.Alert("Connected!", color="success")
+        # Test connection by listing tools
+        _ = list_tools(url, token)
+        return dbc.Alert("Connected!", color="success"), {"url": url, "token": token}
     except Exception as e:
-        return dbc.Alert(f"Connection failed: {e}", color="danger")
+        return dbc.Alert(f"Connection failed: {e}", color="danger"), dash.no_update
 
 @app.callback(
     Output("tools-store", "data"),
     Output("tool-list", "children"),
     Input("list-tools-btn", "n_clicks"),
+    State("connection-store", "data"),
     prevent_initial_call=True
 )
-def list_tools_callback(n):
-    tools = list_tools()
+def list_tools_callback(n, conn):
+    if not conn:
+        return [], dbc.Alert("Not connected.", color="warning")
+    tools = list_tools(conn["url"], conn["token"])
     if not tools:
         return [], dbc.Alert("No tools found or not connected.", color="warning")
     # List as buttons
@@ -373,14 +375,15 @@ def render_tool_input_form(tool):
     State("selected-tool-store", "data"),
     State({'type': 'tool-input', 'key': ALL}, 'value'),
     State({'type': 'tool-input', 'key': ALL}, 'id'),
+    State("connection-store", "data"),
     prevent_initial_call=True
 )
-def call_tool_callback(n, tool, values, ids):
-    if not tool or not n:
+def call_tool_callback(n, tool, values, ids, conn):
+    if not tool or not n or not conn:
         return ""
     # Build arguments dict
     args = {id['key']: val for id, val in zip(ids, values)}
-    result = call_tool(tool['name'], args)
+    result = call_tool(tool['name'], args, conn["url"], conn["token"])
     return dbc.Card([
         dbc.CardBody([
             html.H6("Result", className="mb-2"),
